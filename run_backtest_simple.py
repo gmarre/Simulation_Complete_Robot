@@ -2,7 +2,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from engine.broker import Broker
 from engine.simulator import Simulator
-from robots.grid_robot import GridRobot
 from reporting import visuals
 import os
 from typing import Optional
@@ -10,10 +9,8 @@ import argparse
 from robots.CandleSuite_Paul import CandleSuitePaul
 import logging
 import sys
-from robots.SimpleRobotExample import DailyTimeWindowRobot
+from robots.DailyTimeWindowRobot import DailyTimeWindowRobot
 from reporting.visuals import plot_candles_with_trades
-
-logging.disable(logging.CRITICAL) 
 
 TIMEFRAME_MAP = {
     'm1': '1T',
@@ -132,8 +129,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Backtest CandleSuitePaul / TimeWindow')
     parser.add_argument('--symbol', default='EURGBP')
     parser.add_argument('--file', default='EURGBP_mt5_bars.csv')
-    parser.add_argument('--start', default='2023-09-01')
-    parser.add_argument('--end', default='2024-03-01')
+    parser.add_argument('--start', default='2023-03-01')
+    parser.add_argument('--end', default='2023-05-01')
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--no-plots', action='store_true')
     parser.add_argument('--plots', default='candles_trades,equity,lots,margin', help='Liste des graphiques à afficher (candles_trades, equity, lots)')
@@ -144,7 +141,7 @@ def parse_args():
     parser.add_argument('--inp_lot_for_10k', type=float, default=0.1)
     parser.add_argument('--dist', type=float, default=1.0)
     parser.add_argument('--factor', type=float, default=2.0)
-    parser.add_argument('--max-grid-levels', type=int, default=10)
+    parser.add_argument('--max-grid-levels', type=int, default=100)
     g = parser.add_mutually_exclusive_group()
     g.add_argument('--common-tp', dest='common_tp', action='store_true', default=True)
     g.add_argument('--no-common-tp', dest='common_tp', action='store_false')
@@ -154,7 +151,7 @@ def parse_args():
     parser.add_argument('--progress-interval', type=int, default=2000, help='Barres entre logs de progression')
     parser.add_argument('--timeframe', default='m15',help='Timeframe principal (m1,m5,m15,m30,h1,h4,d1) utilisé pour agrégation simple si besoin')
     parser.add_argument('--plot-candles-tf', default='m15',help='Timeframe spécifique pour plot_candles (sinon = --timeframe)')
-    parser.add_argument('--plot-trades-tf', default='m15',help='Timeframe spécifique pour plot_price_with_trades (sinon = --plot-candles-tf / --timeframe)')
+    parser.add_argument('--plot-trades-tf', default='m30',help='Timeframe spécifique pour plot_price_with_trades (sinon = --plot-candles-tf / --timeframe)')
     return parser.parse_args()
 
 def configure_logging(level: str, log_file: str):
@@ -225,16 +222,17 @@ def main():
 
     # ========== CRÉER LES ROBOTS D'ABORD ==========
     robotPaul1 = CandleSuitePaul(
-        robot_id='CS1_m15',
-        symbol=args.symbol,
-        timeframe='m15',
-        inp_suite=args.suite,
-        inp_xtrem_research=args.xtrem,
-        atr_period=args.atr_period,
-        inp_tp=args.tp,
-        inp_lot_for_10k=args.inp_lot_for_10k,
-        inp_distance_between_orders=args.dist,
-        inp_grid_recov_factor=args.factor,
+        robot_id='CS1_m30',
+        symbol='EURGBP',
+        timeframe='m30',
+        inp_suite=8,
+        inp_xtrem_research=200,
+        atr_period=200,
+        inp_tp=2.5,
+        inp_lot_for_10k=0.1,
+        inp_distance_between_orders=3,
+        inp_grid_recov_factor=2,
+        inversion=False,
         close_on_common_tp=args.common_tp,
         max_grid_levels=args.max_grid_levels,
         debug=False
@@ -313,7 +311,8 @@ def main():
         debug=False
     )
 
-    robots = [robotPaul1, robotPaul2, robotPaul3, robotPaul4, robotPaul5]  # On n'utilise que CandleSuite_Paul
+    #robots = [robotPaul1, robotPaul2, robotPaul3, robotPaul4, robotPaul5]   On n'utilise que CandleSuite_Paul
+    robots = [robotPaul1]
 
     # ========== CALCUL WARM-UP AUTOMATIQUE ==========
     max_warmup = pd.Timedelta(0)
