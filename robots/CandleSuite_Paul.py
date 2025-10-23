@@ -41,14 +41,8 @@ class CandleSuitePaul(StrategyBase):
                  inp_lot_for_10k: float = 0.1,
                  inp_distance_between_orders: float = 1.0, inp_grid_recov_factor: float = 2.0,
                  close_on_common_tp: bool = True, max_grid_levels: int = 0, 
-                 inversion: bool = True,  # ← NOUVEAU PARAMÈTRE
+                 inversion: bool = True,
                  debug: bool = False):
-        """
-        Args:
-            inversion (bool): 
-                - True (défaut): Mean Reversion (contre-tendance)
-                - False: Trend Following (avec la tendance)
-        """
         super().__init__(robot_id, symbol, timeframe=timeframe)
         self.inp_suite = inp_suite
         self.inp_xtrem_research = inp_xtrem_research
@@ -59,15 +53,12 @@ class CandleSuitePaul(StrategyBase):
         self.inp_grid_recov_factor = inp_grid_recov_factor
         self.close_on_common_tp = close_on_common_tp
         self.max_grid_levels = max_grid_levels
-        self.inversion = inversion  # ← Stockage du paramètre
+        self.inversion = inversion
         self.debug = debug
 
-        # ========== LOG MODE STRATÉGIE ==========
         mode = "MEAN REVERSION (contre-tendance)" if self.inversion else "TREND FOLLOWING (continuation)"
         logging.info(f"[{self.robot_id}] 🎯 Mode stratégie: {mode}")
-        # ========================================
 
-        # Buffer optimisé
         self._buffer_max_size = max(self.atr_period, self.inp_xtrem_research) + self.inp_suite + 10
         self.buffer: List[Dict] = []
         
@@ -77,6 +68,17 @@ class CandleSuitePaul(StrategyBase):
         # État SHORT
         self.short_positions: List[Dict] = []
         self.short_atr_first: Optional[float] = None
+
+        # ========== FLAGS POUR ATTENDRE PROCHAINE BOUGIE ==========
+        self.entry_long_pending = False
+        self.entry_short_pending = False
+        self.grid_long_pending = False
+        self.grid_short_pending = False
+        
+        # ========== STOCKAGE DU PRIX D'ENTRÉE VOULU ==========
+        # On stocke le prix OPEN de la bougie suivante pour exécution
+        self.pending_entry_price: Optional[float] = None
+        # ======================================================
 
         self._warmup_logged = False
 
@@ -92,7 +94,7 @@ class CandleSuitePaul(StrategyBase):
     def _calc_base_lots(self) -> float:
         balance = self._get_current_balance()
         lots = (balance / 10000.0) * self.inp_lot_for_10k
-        lots = round(lots, 2)
+        lots = math.ceil(lots * 100) / 100
         if lots < 0.01:
             lots = 0.01
         if self.debug:
@@ -388,33 +390,90 @@ class CandleSuitePaul(StrategyBase):
             return []
         
         orders: List[Order] = []
-        price = bar['close']
 
-        # LONG side
-        if not self.long_positions and self._check_entry_long():
+        # ========== GESTION LONG ==========
+        # 1. Exécuter entrée LONG en attente
+        if self.entry_long_pending:
+            entry_price = bar['open']  # ← PRIX = OPEN de la bougie d'exécution
             mode_desc = "mean reversion (survente)" if self.inversion else "trend following (momentum)"
-            logging.info(f"[{self.robot_id}] [{time}] 🚀 SIGNAL LONG ({mode_desc}) | Prix={price:.5f} | ATR={atr:.5f}")
+            logging.info(f"[{self.robot_id}] [{time}] ✅ ENTRÉE LONG EXÉCUTÉE (prochaine bougie) | {mode_desc} | Prix={entry_price:.5f}")
             lots = self._calc_next_lots('LONG')
+            
+            # ========== STOCKER LE PRIX POUR LE SIMULATEUR ==========
+            self.pending_entry_price = entry_price
+            # ========================================================
+            
             orders.append(Order(self.robot_id, self.symbol, 'BUY', lots, take_profit=None))
-        elif self.long_positions and self._grid_can_add('LONG', price, atr):
+            self.entry_long_pending = False
+        
+        # 2. Exécuter grid LONG en attente
+        elif self.grid_long_pending:
+            entry_price = bar['open']  # ← PRIX = OPEN de la bougie d'exécution
+            logging.info(f"[{self.robot_id}] [{time}] ✅ GRID LONG EXÉCUTÉ (prochaine bougie) | Prix={entry_price:.5f}")
+            lots = self._calc_next_lots('LONG')
+            
+            # ========== STOCKER LE PRIX POUR LE SIMULATEUR ==========
+            self.pending_entry_price = entry_price
+            # ========================================================
+            
+            orders.append(Order(self.robot_id, self.symbol, 'BUY', lots, take_profit=None))
+            self.grid_long_pending = False
+        
+        # 3. Vérifier nouveau signal d'entrée LONG
+        elif not self.long_positions and self._check_entry_long():
+            mode_desc = "mean reversion (survente)" if self.inversion else "trend following (momentum)"
+            current_close = bar['close']
+            logging.info(f"[{self.robot_id}] [{time}] 🔔 SIGNAL LONG DÉTECTÉ ({mode_desc}) | Prix={current_close:.5f} | ATR={atr:.5f} | ATTENTE PROCHAINE BOUGIE")
+            self.entry_long_pending = True
+        
+        # 4. Vérifier nouveau signal de grid LONG
+        elif self.long_positions and self._grid_can_add('LONG', bar['close'], atr):
             last_entry = self.long_positions[-1]['entry']
-            adverse_dist = (last_entry - price) / atr
-            logging.info(f"[{self.robot_id}] [{time}] 📊 GRID ACHETEUR | Niveau {len(self.long_positions)+1} | Distance={adverse_dist:.2f} ATR")
-            lots = self._calc_next_lots('LONG')
-            orders.append(Order(self.robot_id, self.symbol, 'BUY', lots, take_profit=None))
+            adverse_dist = (last_entry - bar['close']) / atr
+            logging.info(f"[{self.robot_id}] [{time}] 🔔 GRID ACHETEUR DÉTECTÉ | Niveau {len(self.long_positions)+1} | Distance={adverse_dist:.2f} ATR | ATTENTE PROCHAINE BOUGIE")
+            self.grid_long_pending = True
 
-        # SHORT side
-        if not self.short_positions and self._check_entry_short():
+        # ========== GESTION SHORT ==========
+        # 1. Exécuter entrée SHORT en attente
+        if self.entry_short_pending:
+            entry_price = bar['open']  # ← PRIX = OPEN de la bougie d'exécution
             mode_desc = "mean reversion (surachat)" if self.inversion else "trend following (momentum)"
-            logging.info(f"[{self.robot_id}] [{time}] 🚀 SIGNAL SHORT ({mode_desc}) | Prix={price:.5f} | ATR={atr:.5f}")
+            logging.info(f"[{self.robot_id}] [{time}] ✅ ENTRÉE SHORT EXÉCUTÉE (prochaine bougie) | {mode_desc} | Prix={entry_price:.5f}")
             lots = self._calc_next_lots('SHORT')
+            
+            # ========== STOCKER LE PRIX POUR LE SIMULATEUR ==========
+            self.pending_entry_price = entry_price
+            # ========================================================
+            
             orders.append(Order(self.robot_id, self.symbol, 'SELL', lots, take_profit=None))
-        elif self.short_positions and self._grid_can_add('SHORT', price, atr):
+            self.entry_short_pending = False
+        
+        # 2. Exécuter grid SHORT en attente
+        elif self.grid_short_pending:
+            entry_price = bar['open']  # ← PRIX = OPEN de la bougie d'exécution
+            logging.info(f"[{self.robot_id}] [{time}] ✅ GRID SHORT EXÉCUTÉ (prochaine bougie) | Prix={entry_price:.5f}")
+            lots = self._calc_next_lots('SHORT')
+            
+            # ========== STOCKER LE PRIX POUR LE SIMULATEUR ==========
+            self.pending_entry_price = entry_price
+            # ========================================================
+            
+            orders.append(Order(self.robot_id, self.symbol, 'SELL', lots, take_profit=None))
+            self.grid_short_pending = False
+        
+        # 3. Vérifier nouveau signal d'entrée SHORT
+        elif not self.short_positions and self._check_entry_short():
+            mode_desc = "mean reversion (surachat)" if self.inversion else "trend following (momentum)"
+            current_close = bar['close']
+            logging.info(f"[{self.robot_id}] [{time}] 🔔 SIGNAL SHORT DÉTECTÉ ({mode_desc}) | Prix={current_close:.5f} | ATR={atr:.5f} | ATTENTE PROCHAINE BOUGIE")
+            self.entry_short_pending = True
+        
+        # 4. Vérifier nouveau signal de grid SHORT
+        elif self.short_positions and self._grid_can_add('SHORT', bar['close'], atr):
             last_entry = self.short_positions[-1]['entry']
-            adverse_dist = (price - last_entry) / atr
-            logging.info(f"[{self.robot_id}] [{time}] 📊 GRID VENDEUR | Niveau {len(self.short_positions)+1} | Distance={adverse_dist:.2f} ATR")
-            lots = self._calc_next_lots('SHORT')
-            orders.append(Order(self.robot_id, self.symbol, 'SELL', lots, take_profit=None))
+            adverse_dist = (bar['close'] - last_entry) / atr
+            logging.info(f"[{self.robot_id}] [{time}] 🔔 GRID VENDEUR DÉTECTÉ | Niveau {len(self.short_positions)+1} | Distance={adverse_dist:.2f} ATR | ATTENTE PROCHAINE BOUGIE")
+            self.grid_short_pending = True
 
         self._current_atr_for_assign = atr
         return orders
@@ -495,10 +554,16 @@ class CandleSuitePaul(StrategyBase):
         logging.info(f"[{self.robot_id}] [{time}] 🔒 Position fermée id={position_id} reason={reason}")
         self.long_positions = [p for p in self.long_positions if p['id'] != position_id]
         self.short_positions = [p for p in self.short_positions if p['id'] != position_id]
+        
         if not self.long_positions:
             self.long_atr_first = None
+            self.entry_long_pending = False   # ← Reset flag si plus de positions
+            self.grid_long_pending = False    # ← Reset flag si plus de positions
+        
         if not self.short_positions:
             self.short_atr_first = None
+            self.entry_short_pending = False  # ← Reset flag si plus de positions
+            self.grid_short_pending = False   # ← Reset flag si plus de positions
 
     def get_warmup_periods(self) -> int:
         return max(self.atr_period, self.inp_xtrem_research) + self.inp_suite + 10

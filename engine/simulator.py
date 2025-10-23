@@ -62,11 +62,17 @@ class Simulator:
                     logging.error(f"[SIM] Exception stratégie {strat.robot_id} @ {t}: {e}")
                 # Execution price: use TF close (row_tf['close'])
                 exec_price = float(row_tf['close'])
-                for o in orders:
-                    if o.symbol == strat.symbol:
-                        pos_id = self.broker.execute(o, exec_price, time=t)
-                        if hasattr(strat, "on_position_opened"):
-                            strat.on_position_opened(pos_id, t)
+                for order in orders:
+                    # Vérifier si le robot a stocké un prix spécifique:
+                    if hasattr(strat, 'pending_entry_price') and strat.pending_entry_price is not None:
+                        execution_price = strat.pending_entry_price
+                        strat.pending_entry_price = None  # Reset après utilisation
+                    else:
+                        execution_price = exec_price  # Prix par défaut (close)
+                    
+                    pos_id = self.broker.execute(order, execution_price, t)
+                    if hasattr(strat, "on_position_opened"):
+                        strat.on_position_opened(pos_id, t)
 
             # TP/SL intrabar: utilise high/low M1
             to_close = []
