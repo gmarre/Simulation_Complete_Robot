@@ -1,107 +1,109 @@
-import logging, time as _time
+import logging
+import time as _time
 from typing import List, Dict
 import pandas as pd
-from engine.broker import Broker, Order
+from engine.broker import Broker
 from engine.strategy_base import StrategyBase
 from engine.data_manager import DataManager
 
 class Simulator:
     """
-    Boucle sur les timestamps M1 (granularité fine) et déclenche chaque stratégie
+    Boucle sur les timestamps M1 et déclenche chaque stratégie
     seulement à la clôture de sa barre (timeframe propre).
     """
     def __init__(self, raw_data_by_symbol: Dict[str, pd.DataFrame], strategies: List[StrategyBase], broker: Broker):
         self.broker = broker
         self.strategies = strategies
-        self.records = []
+        self.records = []  # ← Stocke TOUTES les métriques
+        
         # Data manager
         self.data_mgr = DataManager(raw_data_by_symbol)
-        # Base timeline = union M1 de tous les symboles (suppose M1 données)
+        
+        # Base timeline = union M1 de tous les symboles
         base_indexes = []
         for df in raw_data_by_symbol.values():
             base_indexes.append(df.index)
         if not base_indexes:
             raise ValueError("Aucune donnée fournie.")
-        # Intersection/time union
+        
         self.m1_index = sorted(set().union(*base_indexes))
+        
+        # Liste de tous les symboles disponibles pour conversion
+        self.available_symbols = list(raw_data_by_symbol.keys())
+        
         # Pre-cache timeframe data per strategy
         self._tf_cache = {}
         for strat in self.strategies:
             df_tf = self.data_mgr.get(strat.symbol, strat.timeframe)
             self._tf_cache[strat.robot_id] = df_tf
-            try: strat.set_environment(self.broker)
-            except AttributeError: pass
+            
+            # Set environment for strategy
+            try:
+                strat.set_environment(self.broker)
+            except AttributeError:
+                pass
 
-    def run(self):
+    def run(self) -> pd.DataFrame:
+        """
+        Exécute la simulation et retourne un DataFrame avec les métriques à chaque tick.
+        FIX: Enregistre les métriques À CHAQUE TICK dans self.records
+        """
         start_t = _time.time()
         total = len(self.m1_index)
+        
+        logging.info(f"🚀 Démarrage simulation: {total} ticks M1 à traiter")
+        
         for i, t in enumerate(self.m1_index):
-            # Build last_prices from M1 rows if available
-            last_prices: Dict[str,float] = {}
-            data_slice_symbol_rows: Dict[str, pd.Series] = {}
-
-            for sym, raw_df in self.data_mgr.raw.items():
-                if t in raw_df.index:
-                    row = raw_df.loc[t]
-                    last_prices[sym] = float(row['close'])
-                    data_slice_symbol_rows[sym] = row
-
-            # Trigger strategies that have a bar closing at t
+            # ========== 1. MISE À JOUR DES PRIX ==========
+            current_prices = {}
+            for sym in self.available_symbols:
+                if sym in self.data_mgr.raw and t in self.data_mgr.raw[sym].index:
+                    current_prices[sym] = float(self.data_mgr.raw[sym].loc[t, 'close'])
+            
+            # ========== 2. VÉRIFICATION TP/SL ==========
+            self._check_tp_sl(t, current_prices)
+            
+            # ========== 3. EXÉCUTION DES STRATÉGIES ==========
             for strat in self.strategies:
                 tf_df = self._tf_cache[strat.robot_id]
-                # Only proceed if this timestamp is a bar close for that TF
+                
+                # Trigger uniquement à la clôture de la barre du timeframe
                 if t not in tf_df.index:
                     continue
-                # Build data_slice with only this symbol's TF bar row
+                
                 row_tf = tf_df.loc[t]
-                data_slice = { strat.symbol: row_tf }
+                data_slice = {strat.symbol: row_tf}
+                
                 orders = []
                 try:
                     orders = strat.on_bar(t, data_slice) or []
                 except Exception as e:
                     logging.error(f"[SIM] Exception stratégie {strat.robot_id} @ {t}: {e}")
-                # Execution price: use TF close (row_tf['close'])
+                
+                # Exécution des ordres
                 exec_price = float(row_tf['close'])
+                
                 for order in orders:
-                    # Vérifier si le robot a stocké un prix spécifique:
+                    # Prix d'exécution personnalisé si disponible
                     if hasattr(strat, 'pending_entry_price') and strat.pending_entry_price is not None:
                         execution_price = strat.pending_entry_price
-                        strat.pending_entry_price = None  # Reset après utilisation
+                        strat.pending_entry_price = None
                     else:
-                        execution_price = exec_price  # Prix par défaut (close)
+                        execution_price = exec_price
                     
                     pos_id = self.broker.execute(order, execution_price, t)
+                    
+                    # Notification au robot
                     if hasattr(strat, "on_position_opened"):
-                        strat.on_position_opened(pos_id, t)
-
-            # TP/SL intrabar: utilise high/low M1
-            to_close = []
-            for p in list(self.broker.positions):
-                # Pour précision, utiliser la barre M1 si dispo
-                m1_df = self.data_mgr.raw.get(p.symbol)
-                if m1_df is None or t not in m1_df.index:
-                    continue
-                bar_m1 = m1_df.loc[t]
-                high = bar_m1['high']
-                low = bar_m1['low']
-                if p.take_profit is not None:
-                    if p.side == 'LONG' and high >= p.take_profit:
-                        to_close.append((p.id, p.take_profit, "tp"))
-                    elif p.side == 'SHORT' and low <= p.take_profit:
-                        to_close.append((p.id, p.take_profit, "tp"))
-
-            for pid, px, reason in to_close:
-                pos = next((pp for pp in self.broker.positions if pp.id == pid), None)
-                rid = pos.robot_id if pos else None
-                self.broker.close_position(pid, px, time=t, reason=reason)
-                if rid:
-                    strat = next((s for s in self.strategies if s.robot_id == rid), None)
-                    if strat and hasattr(strat, "on_position_closed"):
-                        strat.on_position_closed(pid, t, reason)
-
-            # Metrics (equity every minute)
-            equity = self.broker.equity(last_prices) if last_prices else self.broker.balance
-            unreal = self.broker.unrealized_pnl(last_prices) if last_prices else 0.0
+                        try:
+                            strat.on_position_opened(pos_id, t)
+                        except Exception as e:
+                            logging.error(f"[SIM] Erreur on_position_opened {strat.robot_id}: {e}")
+            
+            # ========== 4. ENREGISTREMENT MÉTRIQUES (À CHAQUE TICK) ==========
+            equity = self.broker.equity(current_prices) if current_prices else self.broker.balance
+            unreal = self.broker.unrealized_pnl(current_prices) if current_prices else 0.0
+            
             row_metric = {
                 'time': t,
                 'balance': self.broker.balance,
@@ -109,25 +111,100 @@ class Simulator:
                 'unrealized_pnl': unreal,
                 'open_positions': len(self.broker.positions),
                 'lots_open': self.broker.lots_open(),
-                'margin_used': self.broker.margin_used(last_prices) if last_prices else 0.0
+                'margin_used': self.broker.margin_used(current_prices) if current_prices else 0.0
             }
+            
+            # Lots par robot
             for rid, lots in self.broker.lots_by_robot().items():
                 row_metric[f'lots_{rid}'] = lots
-            for p in self.broker.positions:
-                if p.symbol in last_prices:
-                    key = f'unrealized_pnl_{p.robot_id}'
-                    row_metric[key] = row_metric.get(key, 0.0) + self.broker._pnl_unrealized_single(p, last_prices[p.symbol])
-            self.records.append(row_metric)
-
-            if (i+1) % 5000 == 0:
+            
+            self.records.append(row_metric)  # ← STOCKAGE À CHAQUE TICK
+            # =================================================================
+            
+            # Progress log
+            if (i + 1) % 5000 == 0:
                 elapsed = _time.time() - start_t
-                logging.info(f"[SIM] Progress {i+1}/{total} {(i+1)/total:.1%} elapsed={elapsed:.1f}s open={len(self.broker.positions)}")
-
+                logging.info(
+                    f"[SIM] Progress {i+1}/{total} ({(i+1)/total*100:.1f}%) | "
+                    f"Temps={elapsed:.1f}s | Positions={len(self.broker.positions)}"
+                )
+        
+        # ========== 5. FINALISATION ==========
         for strat in self.strategies:
             if hasattr(strat, 'on_finish'):
-                try: strat.on_finish()
-                except Exception: pass
-
+                try:
+                    strat.on_finish()
+                except Exception as e:
+                    logging.error(f"[SIM] Erreur on_finish {strat.robot_id}: {e}")
+        
         elapsed = _time.time() - start_t
-        logging.info(f"[SIM] Terminé. Barres M1={total} durée={elapsed:.2f}s positions_finales={len(self.broker.positions)}")
-        return pd.DataFrame(self.records)
+        logging.info(
+            f"[SIM] ✅ Simulation terminée | "
+            f"Barres M1={total} | Durée={elapsed:.2f}s | "
+            f"Positions finales={len(self.broker.positions)} | "
+            f"Métriques enregistrées={len(self.records)}"
+        )
+        
+        # ========== 6. RETOUR DU DATAFRAME ==========
+        results_df = pd.DataFrame(self.records)
+        
+        if results_df.empty:
+            logging.warning("⚠️ Aucune métrique enregistrée!")
+            return pd.DataFrame()
+        
+        logging.info(f"📊 DataFrame créé: {len(results_df)} lignes × {len(results_df.columns)} colonnes")
+        return results_df
+        # ============================================
+
+    def _check_tp_sl(self, time, current_prices: Dict[str, float]):
+        """Vérifie les TP/SL pour toutes les positions avec conversion automatique"""
+        positions_to_close = []
+        
+        for pos in self.broker.positions:
+            current_price = current_prices.get(pos.symbol)
+            if current_price is None:
+                continue
+            
+            tp_hit = False
+            sl_hit = False
+            
+            # Normalisation du side
+            is_long = pos.side in ('LONG', 'BUY')
+            is_short = pos.side in ('SHORT', 'SELL')
+            
+            # Vérification TP
+            if pos.take_profit is not None:
+                if is_long:
+                    tp_hit = current_price >= pos.take_profit
+                elif is_short:
+                    tp_hit = current_price <= pos.take_profit
+            
+            # Vérification SL
+            if pos.stop_loss is not None:
+                if is_long:
+                    sl_hit = current_price <= pos.stop_loss
+                elif is_short:
+                    sl_hit = current_price >= pos.stop_loss
+            
+            if tp_hit:
+                positions_to_close.append((pos.id, current_price, 'tp'))
+            elif sl_hit:
+                positions_to_close.append((pos.id, current_price, 'sl'))
+
+        # Fermeture des positions
+        for pos_id, price, reason in positions_to_close:
+            self.broker.close_position(
+                pos_id,
+                price,
+                reason=reason,
+                time=time,
+                current_prices=current_prices
+            )
+            
+            # Notification au robot
+            for strat in self.strategies:
+                if hasattr(strat, 'on_position_closed'):
+                    try:
+                        strat.on_position_closed(pos_id, time, reason)
+                    except Exception as e:
+                        logging.error(f"[SIM] Erreur on_position_closed {strat.robot_id}: {e}")

@@ -225,21 +225,22 @@ def plot_margin(results: pd.DataFrame):
 
 def plot_price_with_trades(data: pd.DataFrame, trade_events, title="Price + Trades"):
     if data.empty:
-        print("Pas de données pour tracer trades.")
+        print("Données vides, impossible de tracer.")
         return
     dfp = data.copy()
     fig, ax = plt.subplots(figsize=(12,5))
     ax.plot(dfp.index, dfp['close'], color='black', linewidth=1, label='Close')
 
-    opens_long = [(e['time'], e['price']) for e in trade_events if e['event']=='open' and e['side']=='LONG']
-    opens_short = [(e['time'], e['price']) for e in trade_events if e['event']=='open' and e['side']=='SHORT']
-    closes_long = [(e['time'], e['price']) for e in trade_events if e['event']=='close' and e['side']=='LONG']
-    closes_short = [(e['time'], e['price']) for e in trade_events if e['event']=='close' and e['side']=='SHORT']
+    # FIX: Utiliser 'action' au lieu de 'event'
+    opens_long = [(e['time'], e['price']) for e in trade_events if e['action'].upper() == 'OPEN' and e['side'] == 'LONG']
+    opens_short = [(e['time'], e['price']) for e in trade_events if e['action'].upper() == 'OPEN' and e['side'] == 'SHORT']
+    closes_long = [(e['time'], e['price']) for e in trade_events if e['action'].upper() == 'CLOSE' and e['side'] == 'LONG']
+    closes_short = [(e['time'], e['price']) for e in trade_events if e['action'].upper() == 'CLOSE' and e['side'] == 'SHORT']
 
     def sc(points, marker, color, label):
         if points:
-            tms, prs = zip(*points)
-            ax.scatter(tms, prs, marker=marker, color=color, edgecolor='k', s=55, linewidths=0.4, label=label, zorder=5)
+            times, prices = zip(*points)
+            ax.scatter(times, prices, marker=marker, color=color, s=100, label=label, zorder=5, edgecolors='black', linewidths=1)
 
     sc(opens_long, '^', 'green', 'Buy')
     sc(opens_short, 'v', 'red', 'Sell')
@@ -273,18 +274,14 @@ def plot_candles_with_trades(
     FIX: utilise addplot (mplfinance) pour aligner correctement timestamps.
     """
     if data is None or data.empty:
-        logging.warning("plot_candles_with_trades: DataFrame vide.")
+        logging.warning("Données vides, impossible de tracer les chandeliers.")
         return
     df = data.copy()
     if limit and limit > 0 and len(df) > limit:
-        df = df.tail(limit)
+        df = df.iloc[-limit:]
 
     if not isinstance(df.index, pd.DatetimeIndex):
-        try:
-            df.index = pd.to_datetime(df.index)
-        except Exception:
-            logging.error("Index non convertible en datetime.")
-            return
+        df.index = pd.to_datetime(df.index)
 
     # Préparation OHLC
     ohlc = df[['open','high','low','close']].copy()
@@ -292,146 +289,127 @@ def plot_candles_with_trades(
 
     # Mapping couleurs robots
     robots = sorted({e.get('robot_id','') for e in trade_events if e.get('robot_id')})
-    base_colors = ['tab:blue','tab:orange','tab:green','tab:red','tab:purple','tab:brown','tab:pink','tab:gray','tab:olive','tab:cyan']
-    robot_color_map = {}
-    for i, rid in enumerate(robots):
-        robot_color_map[rid] = base_colors[i % len(base_colors)]
-
-    # Helper align time
-    def nearest_ts(ts):
-        if ts in ohlc.index:
-            return ts
-        pos = ohlc.index.searchsorted(ts)
-        if pos <= 0:
-            return ohlc.index[0]
-        if pos >= len(ohlc.index):
-            return ohlc.index[-1]
-        before = ohlc.index[pos-1]
-        after = ohlc.index[pos]
-        return before if (ts - before) <= (after - ts) else after
-
-    # Traitement événements
-    processed = []
+    robot_colors = {}
+    if robot_coloring and robots:
+        cmap = plt.get_cmap('tab10')
+        for i, rid in enumerate(robots):
+            robot_colors[rid] = cmap(i % 10)
+    
+    # FIX: Utiliser 'action' au lieu de 'event'
+    opens_buy = []
+    opens_sell = []
+    closes_buy = []
+    closes_sell = []
+    
     for e in trade_events:
-        t = e.get('time')
-        if t is None:
+        t = pd.to_datetime(e['time'])
+        if align_to_nearest and t not in ohlc.index:
+            idx = ohlc.index.get_indexer([t], method='nearest')[0]
+            if idx >= 0:
+                t = ohlc.index[idx]
+        
+        if t not in ohlc.index:
             continue
-        if not isinstance(t, pd.Timestamp):
-            try:
-                t = pd.Timestamp(t)
-            except Exception:
-                continue
-        if align_to_nearest:
-            t_aligned = nearest_ts(t)
-        else:
-            if t not in ohlc.index:
-                continue
-            t_aligned = t
-        # Filtrer hors fenêtre
-        if t_aligned < ohlc.index[0] or t_aligned > ohlc.index[-1]:
-            continue
-        pe = dict(e)
-        pe['_t'] = t_aligned
-        processed.append(pe)
-
-    if _HAS_MPF:
-        # Créer des séries pour chaque type de marker alignées sur ohlc.index
-        # Initialiser NaN partout
-        open_long_series = pd.Series(index=ohlc.index, dtype=float)
-        open_short_series = pd.Series(index=ohlc.index, dtype=float)
-        close_long_series = pd.Series(index=ohlc.index, dtype=float)
-        close_short_series = pd.Series(index=ohlc.index, dtype=float)
-
-        for e in processed:
-            t_aligned = e['_t']
-            price = e.get('price')
-            if price is None:
-                continue
-            if e.get('event') == 'open' and e.get('side') == 'LONG':
-                open_long_series.loc[t_aligned] = price
-            elif e.get('event') == 'open' and e.get('side') == 'SHORT':
-                open_short_series.loc[t_aligned] = price
-            elif e.get('event') == 'close' and e.get('side') == 'LONG':
-                close_long_series.loc[t_aligned] = price
-            elif e.get('event') == 'close' and e.get('side') == 'SHORT':
-                close_short_series.loc[t_aligned] = price
-
-        # Construire addplot
-        apds = []
-        if not open_long_series.isna().all():
-            apds.append(mpf.make_addplot(open_long_series, type='scatter', markersize=60, marker='^', color='green', secondary_y=False))
-        if not open_short_series.isna().all():
-            apds.append(mpf.make_addplot(open_short_series, type='scatter', markersize=60, marker='v', color='red', secondary_y=False))
-        if not close_long_series.isna().all():
-            apds.append(mpf.make_addplot(close_long_series, type='scatter', markersize=50, marker='x', color='darkgreen', secondary_y=False))
-        if not close_short_series.isna().all():
-            apds.append(mpf.make_addplot(close_short_series, type='scatter', markersize=50, marker='x', color='darkred', secondary_y=False))
-
-        plot_kwargs = dict(type='candle', style='yahoo', title=title, volume=volume, figsize=(13,6), returnfig=True)
-        if mav:
-            plot_kwargs['mav'] = mav
-        if apds:
-            plot_kwargs['addplot'] = apds
-
-        fig, axlist = mpf.plot(ohlc, **plot_kwargs)
-        ax_price = axlist[0]
-
-        # Annotations (optionnel)
-        if annotate:
-            for idx_a, e in enumerate(processed):
-                if idx_a >= max_annot:
-                    break
-                t_aligned = e['_t']
-                price = e.get('price')
-                txt = e.get('robot_id','')
-                pid = e.get('position_id')
-                if pid is not None:
-                    txt += f"#{pid}"
-                color = robot_color_map.get(e.get('robot_id'), 'blue') if robot_coloring else 'blue'
-                ax_price.text(t_aligned, price, txt, fontsize=7, ha='center', va='bottom', color=color)
-
-        # Légende manuelle (mplfinance n'ajoute pas de labels aux addplot)
-        from matplotlib.lines import Line2D
-        legend_elements = [
-            Line2D([0],[0], marker='^', color='w', markerfacecolor='green', markersize=8, label='Buy Open'),
-            Line2D([0],[0], marker='v', color='w', markerfacecolor='red', markersize=8, label='Sell Open'),
-            Line2D([0],[0], marker='x', color='w', markerfacecolor='darkgreen', markersize=8, label='Buy Close'),
-            Line2D([0],[0], marker='x', color='w', markerfacecolor='darkred', markersize=8, label='Sell Close')
-        ]
-        ax_price.legend(handles=legend_elements, loc='upper left')
-        ax_price.grid(alpha=0.25)
-        plt.tight_layout()
-        plt.show()
-    else:
-        # Fallback manuel (inchangé, déjà OK)
-        fig, ax = plt.subplots(figsize=(13,6))
-        width = 0.6
-        for t in ohlc.index:
-            o = ohlc.at[t,'Open']; h = ohlc.at[t,'High']; l = ohlc.at[t,'Low']; c = ohlc.at[t,'Close']
-            col = 'green' if c >= o else 'red'
-            ax.plot([t,t],[l,h], color=col, linewidth=1)
-            top = max(o,c); bottom = min(o,c)
-            height = top-bottom if top!=bottom else (abs(c)*1e-7 or 1e-7)
-            rect = Rectangle((t, bottom), width, height, facecolor=col, edgecolor='black', linewidth=0.4)
-            ax.add_patch(rect)
-
-        for e in processed:
-            color = robot_color_map.get(e.get('robot_id'), 'blue') if robot_coloring else (
-                'green' if e.get('side')=='LONG' else 'red')
-            marker = '^' if (e.get('event')=='open' and e.get('side')=='LONG') else \
-                     'v' if (e.get('event')=='open' and e.get('side')=='SHORT') else 'x'
-            ax.scatter(e['_t'], e.get('price'), marker=marker, color=color,
-                       edgecolor='k', s=60, linewidths=0.4, zorder=5)
-            if annotate:
-                txt = e.get('robot_id','')
-                pid = e.get('position_id')
-                if pid is not None:
-                    txt += f"#{pid}"
-                ax.text(e['_t'], e.get('price'), txt, fontsize=7, ha='center', va='bottom', color=color)
-
-        ax.set_title(title + " (fallback)")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Price")
-        ax.grid(alpha=0.25)
-        plt.tight_layout()
-        plt.show()
+        
+        price = e.get('price', ohlc.loc[t, 'Close'])
+        side = e.get('side', '').upper()
+        action = e.get('action', '').upper()  # ← FIX: 'action' au lieu de 'event'
+        robot_id = e.get('robot_id', '')
+        
+        color = robot_colors.get(robot_id, 'black') if robot_coloring else 'black'
+        
+        if action == 'OPEN':
+            if side == 'LONG' or side == 'BUY':
+                opens_buy.append((t, price, color, robot_id))
+            elif side == 'SHORT' or side == 'SELL':
+                opens_sell.append((t, price, color, robot_id))
+        elif action == 'CLOSE':
+            if side == 'LONG' or side == 'BUY':
+                closes_buy.append((t, price, color, robot_id))
+            elif side == 'SHORT' or side == 'SELL':
+                closes_sell.append((t, price, color, robot_id))
+    
+    # ========== CRÉATION DES SÉRIES POUR MARKERS ==========
+    # Créer une série par trade avec NaN partout sauf au timestamp du trade
+    all_addplots = []
+    
+    # Buy Opens (triangles verts ▲)
+    for t, price, color, robot_id in opens_buy:
+        series = pd.Series([float('nan')] * len(ohlc), index=ohlc.index)
+        series.loc[t] = price
+        all_addplots.append(mpf.make_addplot(
+            series, 
+            type='scatter', 
+            markersize=120, 
+            marker='^', 
+            color=color,
+            secondary_y=False, 
+            panel=0
+        ))
+    
+    # Sell Opens (triangles rouges ▼)
+    for t, price, color, robot_id in opens_sell:
+        series = pd.Series([float('nan')] * len(ohlc), index=ohlc.index)
+        series.loc[t] = price
+        all_addplots.append(mpf.make_addplot(
+            series, 
+            type='scatter', 
+            markersize=120, 
+            marker='v', 
+            color=color,
+            secondary_y=False, 
+            panel=0
+        ))
+    
+    # Buy Closes (croix vertes ✖)
+    for t, price, color, robot_id in closes_buy:
+        series = pd.Series([float('nan')] * len(ohlc), index=ohlc.index)
+        series.loc[t] = price
+        all_addplots.append(mpf.make_addplot(
+            series, 
+            type='scatter', 
+            markersize=100, 
+            marker='x', 
+            color=color,
+            secondary_y=False, 
+            panel=0
+        ))
+    
+    # Sell Closes (croix rouges ✖)
+    for t, price, color, robot_id in closes_sell:
+        series = pd.Series([float('nan')] * len(ohlc), index=ohlc.index)
+        series.loc[t] = price
+        all_addplots.append(mpf.make_addplot(
+            series, 
+            type='scatter', 
+            markersize=100, 
+            marker='x', 
+            color=color,
+            secondary_y=False, 
+            panel=0
+        ))
+    
+    # ========== LOGS DEBUG ==========
+    logging.info(f"📍 Markers créés:")
+    logging.info(f"   - Buy Opens: {len(opens_buy)}")
+    logging.info(f"   - Sell Opens: {len(opens_sell)}")
+    logging.info(f"   - Buy Closes: {len(closes_buy)}")
+    logging.info(f"   - Sell Closes: {len(closes_sell)}")
+    logging.info(f"   - Total addplots: {len(all_addplots)}")
+    # ===============================
+    
+    # Plot
+    kwargs = {
+        'type': 'candle',
+        'style': 'charles',
+        'title': title,
+        'ylabel': 'Price',
+        'volume': volume,
+        'addplot': all_addplots if all_addplots else None,
+        'warn_too_much_data': 10000
+    }
+    
+    if mav:
+        kwargs['mav'] = mav
+    
+    mpf.plot(ohlc, **kwargs)

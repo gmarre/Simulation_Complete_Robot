@@ -315,30 +315,65 @@ class CandleSuitePaul(StrategyBase):
         return lots
 
     def _apply_common_tp(self, side: str):
+        """
+        Calcule et applique le TP commun pour toutes les positions d'un côté.
+        
+        Logique:
+        - LONG: TP = prix moyen + profit cible réparti
+        - SHORT: TP = prix moyen - profit cible réparti
+        
+        Le profit cible est calculé en PIPS (ATR * tp_multiplier * first_lots),
+        puis converti en mouvement de prix et réparti sur le total des lots.
+        """
         if not self._broker or not self.close_on_common_tp:
             return
         
         if side == 'LONG':
             if not self.long_positions or self.long_atr_first is None:
                 return
+            
+            # ========== CALCUL TP LONG (CORRIGÉ) ==========
             first_lots = self.long_positions[0]['lots']
-            target_profit = first_lots * self.long_atr_first * self.inp_tp
+            
+            # Profit cible en unités de prix (pips)
+            target_profit_pips = first_lots * self.long_atr_first * self.inp_tp
+            
+            # Prix moyen d'entrée pondéré
             total_lots = sum(p['lots'] for p in self.long_positions)
-            numerator = target_profit + sum(p['lots'] * p['entry'] for p in self.long_positions)
-            tp = numerator / total_lots
+            weighted_entry = sum(p['lots'] * p['entry'] for p in self.long_positions) / total_lots
+            
+            # TP = prix moyen + profit réparti sur tous les lots
+            # Pour LONG: on AJOUTE le profit
+            tp = weighted_entry + (target_profit_pips / total_lots)
+            # =============================================
+            
             for p in self.long_positions:
                 self._broker.update_take_profit(p['id'], tp)
+            
             logging.debug(f"[{self.robot_id}] Recalc TP commun LONG -> {tp:.5f} niveaux={len(self.long_positions)}")
-        else:
+        
+        else:  # SHORT
             if not self.short_positions or self.short_atr_first is None:
                 return
+            
+            # ========== CALCUL TP SHORT (DÉJÀ CORRECT) ==========
             first_lots = self.short_positions[0]['lots']
-            target_profit = first_lots * self.short_atr_first * self.inp_tp
+            
+            # Profit cible en unités de prix (pips)
+            target_profit_pips = first_lots * self.short_atr_first * self.inp_tp
+            
+            # Prix moyen d'entrée pondéré
             total_lots = sum(p['lots'] for p in self.short_positions)
-            numerator = sum(p['lots'] * p['entry'] for p in self.short_positions) - target_profit
-            tp = numerator / total_lots
+            weighted_entry = sum(p['lots'] * p['entry'] for p in self.short_positions) / total_lots
+            
+            # TP = prix moyen - profit réparti sur tous les lots
+            # Pour SHORT: on SOUSTRAIT le profit
+            tp = weighted_entry - (target_profit_pips / total_lots)
+            # ===================================================
+            
             for p in self.short_positions:
                 self._broker.update_take_profit(p['id'], tp)
+            
             logging.debug(f"[{self.robot_id}] Recalc TP commun SHORT -> {tp:.5f} niveaux={len(self.short_positions)}")
 
     def _set_individual_tp(self, pos_id: int, side: str, entry: float, atr: float):
@@ -483,67 +518,65 @@ class CandleSuitePaul(StrategyBase):
         if not self._broker:
             return
         
-        # ========== RÉCUPÉRATION POSITION DEPUIS LISTE ==========
-        # broker.positions est une LISTE d'objets Position
+        # Récupération position
         pos_obj = None
         for p in self._broker.positions:
             if p.id == position_id:
                 pos_obj = p
                 break
-    
+
         if not pos_obj:
             logging.warning(f"[{self.robot_id}] [{time}] ⚠️ Position {position_id} introuvable")
             return
-    
-        # Convertir l'objet Position en dict pour uniformité
+
         pos = {
             'id': pos_obj.id,
             'side': pos_obj.side,
             'price': pos_obj.entry_price,
             'lots': pos_obj.lots
         }
-        # ========================================================
-    
+
         atr = getattr(self, '_current_atr_for_assign', None)
-    
+
+        # ========== NORMALISATION DU SIDE (CORRIGÉ) ==========
+        is_long = pos['side'] in ('LONG', 'BUY')
+        is_short = pos['side'] in ('SHORT', 'SELL')
+        # =====================================================
+
         # ========== GESTION LONG ==========
-        if pos['side'] == 'LONG':
+        if is_long:  # ← Utiliser le booléen normalisé
             self.long_positions.append({
                 'id': pos['id'],
                 'entry': pos['price'],
                 'lots': pos['lots']
             })
             
-            # Stocker ATR de la première position
             if len(self.long_positions) == 1:
                 if self.long_atr_first is None and atr is not None:
                     self.long_atr_first = atr
                     if self.debug:
                         logging.debug(f"[{self.robot_id}] LONG: ATR référence = {atr:.5f}")
-        
-            # Recalculer TP commun ou individuel
+    
             if self.close_on_common_tp:
                 self._apply_common_tp('LONG')
             else:
                 if atr:
                     self._set_individual_tp(pos['id'], 'LONG', pos['price'], atr)
-    
+
         # ========== GESTION SHORT ==========
-        else:
+        elif is_short:  # ← Utiliser le booléen normalisé
             self.short_positions.append({
                 'id': pos['id'],
                 'entry': pos['price'],
                 'lots': pos['lots']
             })
             
-            # Stocker ATR de la première position
             if len(self.short_positions) == 1:
                 if self.short_atr_first is None and atr is not None:
                     self.short_atr_first = atr
                     if self.debug:
                         logging.debug(f"[{self.robot_id}] SHORT: ATR référence = {atr:.5f}")
-        
-            # Recalculer TP commun ou individuel
+    
             if self.close_on_common_tp:
                 self._apply_common_tp('SHORT')
             else:
@@ -551,19 +584,43 @@ class CandleSuitePaul(StrategyBase):
                     self._set_individual_tp(pos['id'], 'SHORT', pos['price'], atr)
 
     def on_position_closed(self, position_id: int, time, reason: str):
-        logging.info(f"[{self.robot_id}] [{time}] 🔒 Position fermée id={position_id} reason={reason}")
+        """Callback appelé quand une position est fermée."""
+        
+        # ========== DEBUG: AFFICHER ÉTAT AVANT ==========
+        logging.info(
+            f"[{self.robot_id}] [{time}] 🔒 Position fermée id={position_id} reason={reason}\n"
+            f"  État AVANT nettoyage:\n"
+            f"    - long_positions: {[p['id'] for p in self.long_positions]}\n"
+            f"    - short_positions: {[p['id'] for p in self.short_positions]}\n"
+            f"    - long_atr_first: {self.long_atr_first}\n"
+            f"    - short_atr_first: {self.short_atr_first}"
+        )
+        # ================================================
+        
+        # Supprimer la position fermée des listes
         self.long_positions = [p for p in self.long_positions if p['id'] != position_id]
         self.short_positions = [p for p in self.short_positions if p['id'] != position_id]
         
+        # ========== DEBUG: AFFICHER ÉTAT APRÈS ==========
+        logging.info(
+            f"[{self.robot_id}] [{time}] État APRÈS nettoyage:\n"
+            f"    - long_positions: {[p['id'] for p in self.long_positions]}\n"
+            f"    - short_positions: {[p['id'] for p in self.short_positions]}"
+        )
+        # ================================================
+        
+        # Réinitialiser ATR et flags si plus de positions
         if not self.long_positions:
+            logging.info(f"[{self.robot_id}] [{time}] 🔄 RESET LONG (plus de positions)")
             self.long_atr_first = None
-            self.entry_long_pending = False   # ← Reset flag si plus de positions
-            self.grid_long_pending = False    # ← Reset flag si plus de positions
+            self.entry_long_pending = False
+            self.grid_long_pending = False
         
         if not self.short_positions:
+            logging.info(f"[{self.robot_id}] [{time}] 🔄 RESET SHORT (plus de positions)")
             self.short_atr_first = None
-            self.entry_short_pending = False  # ← Reset flag si plus de positions
-            self.grid_short_pending = False   # ← Reset flag si plus de positions
+            self.entry_short_pending = False
+            self.grid_short_pending = False
 
     def get_warmup_periods(self) -> int:
         return max(self.atr_period, self.inp_xtrem_research) + self.inp_suite + 10
