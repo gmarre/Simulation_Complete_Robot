@@ -14,7 +14,7 @@ class Simulator:
     def __init__(self, raw_data_by_symbol: Dict[str, pd.DataFrame], strategies: List[StrategyBase], broker: Broker):
         self.broker = broker
         self.strategies = strategies
-        self.records = []  # ← Stocke TOUTES les métriques
+        self.records = []
         
         # Data manager
         self.data_mgr = DataManager(raw_data_by_symbol)
@@ -46,7 +46,6 @@ class Simulator:
     def run(self) -> pd.DataFrame:
         """
         Exécute la simulation et retourne un DataFrame avec les métriques à chaque tick.
-        FIX: Enregistre les métriques À CHAQUE TICK dans self.records
         """
         start_t = _time.time()
         total = len(self.m1_index)
@@ -54,13 +53,21 @@ class Simulator:
         logging.info(f"🚀 Démarrage simulation: {total} ticks M1 à traiter")
         
         for i, t in enumerate(self.m1_index):
-            # ========== 1. MISE À JOUR DES PRIX ==========
+            # ========== 1. MISE À JOUR DES PRIX (OHLC COMPLET) ==========
             current_prices = {}
             for sym in self.available_symbols:
                 if sym in self.data_mgr.raw and t in self.data_mgr.raw[sym].index:
-                    current_prices[sym] = float(self.data_mgr.raw[sym].loc[t, 'close'])
+                    row = self.data_mgr.raw[sym].loc[t]
+                    current_prices[sym] = {
+                        'open': float(row['open']),
+                        'high': float(row['high']),
+                        'low': float(row['low']),
+                        'close': float(row['close']),
+                        'bid': float(row['close']),  # Simplifié: bid = close
+                        'ask': float(row['close'])   # Simplifié: ask = close
+                    }
             
-            # ========== 2. VÉRIFICATION TP/SL ==========
+            # ========== 2. VÉRIFICATION TP/SL (avec high/low) ==========
             self._check_tp_sl(t, current_prices)
             
             # ========== 3. EXÉCUTION DES STRATÉGIES ==========
@@ -100,7 +107,7 @@ class Simulator:
                         except Exception as e:
                             logging.error(f"[SIM] Erreur on_position_opened {strat.robot_id}: {e}")
             
-            # ========== 4. ENREGISTREMENT MÉTRIQUES (À CHAQUE TICK) ==========
+            # ========== 4. ENREGISTREMENT MÉTRIQUES ==========
             equity = self.broker.equity(current_prices) if current_prices else self.broker.balance
             unreal = self.broker.unrealized_pnl(current_prices) if current_prices else 0.0
             
@@ -118,10 +125,9 @@ class Simulator:
             for rid, lots in self.broker.lots_by_robot().items():
                 row_metric[f'lots_{rid}'] = lots
             
-            self.records.append(row_metric)  # ← STOCKAGE À CHAQUE TICK
-            # =================================================================
+            self.records.append(row_metric)
             
-            # Progress log
+            # Log de progression
             if (i + 1) % 5000 == 0:
                 elapsed = _time.time() - start_t
                 logging.info(
@@ -156,14 +162,24 @@ class Simulator:
         return results_df
         # ============================================
 
-    def _check_tp_sl(self, time, current_prices: Dict[str, float]):
-        """Vérifie les TP/SL pour toutes les positions avec conversion automatique"""
+    def _check_tp_sl(self, time, current_prices: Dict[str, Dict[str, float]]):
+        """
+        Vérifie les TP/SL pour toutes les positions.
+        FIX: Utilise HIGH pour TP LONG et LOW pour TP SHORT (réaliste intra-barre)
+        """
         positions_to_close = []
         
         for pos in self.broker.positions:
-            current_price = current_prices.get(pos.symbol)
-            if current_price is None:
+            symbol_prices = current_prices.get(pos.symbol)
+            if symbol_prices is None:
                 continue
+            
+            # Prix de clôture pour fermeture effective
+            close_price = symbol_prices['close']
+            
+            # Prix réels d'atteinte TP/SL (high/low)
+            high_price = symbol_prices['high']
+            low_price = symbol_prices['low']
             
             tp_hit = False
             sl_hit = False
@@ -172,26 +188,57 @@ class Simulator:
             is_long = pos.side in ('LONG', 'BUY')
             is_short = pos.side in ('SHORT', 'SELL')
             
-            # Vérification TP
+            # ========== VÉRIFICATION TP (avec high/low) ==========
             if pos.take_profit is not None:
                 if is_long:
-                    tp_hit = current_price >= pos.take_profit
+                    # LONG: TP atteint si HIGH >= TP
+                    tp_hit = high_price >= pos.take_profit
+                    if tp_hit:
+                        logging.info(
+                            f"[SIM] [{time}] 🎯 TP HIT LONG | Pos {pos.id} | "
+                            f"TP={pos.take_profit:.5f} | High={high_price:.5f} | "
+                            f"Fermeture à close={close_price:.5f}"
+                        )
+                
                 elif is_short:
-                    tp_hit = current_price <= pos.take_profit
+                    # SHORT: TP atteint si LOW <= TP
+                    tp_hit = low_price <= pos.take_profit
+                    if tp_hit:
+                        logging.info(
+                            f"[SIM] [{time}] 🎯 TP HIT SHORT | Pos {pos.id} | "
+                            f"TP={pos.take_profit:.5f} | Low={low_price:.5f} | "
+                            f"Fermeture à close={close_price:.5f}"
+                        )
             
-            # Vérification SL
+            # ========== VÉRIFICATION SL (avec high/low) ==========
             if pos.stop_loss is not None:
                 if is_long:
-                    sl_hit = current_price <= pos.stop_loss
+                    # LONG: SL atteint si LOW <= SL
+                    sl_hit = low_price <= pos.stop_loss
+                    if sl_hit:
+                        logging.info(
+                            f"[SIM] [{time}] 🛑 SL HIT LONG | Pos {pos.id} | "
+                            f"SL={pos.stop_loss:.5f} | Low={low_price:.5f} | "
+                            f"Fermeture à close={close_price:.5f}"
+                        )
+                
                 elif is_short:
-                    sl_hit = current_price >= pos.stop_loss
+                    # SHORT: SL atteint si HIGH >= SL
+                    sl_hit = high_price >= pos.stop_loss
+                    if sl_hit:
+                        logging.info(
+                            f"[SIM] [{time}] 🛑 SL HIT SHORT | Pos {pos.id} | "
+                            f"SL={pos.stop_loss:.5f} | High={high_price:.5f} | "
+                            f"Fermeture à close={close_price:.5f}"
+                        )
             
+            # Fermeture au prix de clôture (approximation réaliste)
             if tp_hit:
-                positions_to_close.append((pos.id, current_price, 'tp'))
+                positions_to_close.append((pos.id, close_price, 'tp'))
             elif sl_hit:
-                positions_to_close.append((pos.id, current_price, 'sl'))
+                positions_to_close.append((pos.id, close_price, 'sl'))
 
-        # Fermeture des positions
+        # ========== FERMETURE DES POSITIONS ==========
         for pos_id, price, reason in positions_to_close:
             self.broker.close_position(
                 pos_id,

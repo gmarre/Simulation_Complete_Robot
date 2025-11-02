@@ -59,15 +59,7 @@ class CurrencyConverter:
     ) -> tuple:
         """
         Convertit un PnL de la devise du symbole vers EUR.
-        
-        Args:
-            pnl_amount: Montant du PnL dans la devise de cotation
-            symbol: Symbole tradé (ex: 'EURGBP')
-            current_prices: Dict des prix actuels {symbol: price}
-            time: Timestamp pour logs
-        
-        Returns:
-            (pnl_eur, conversion_rate, conversion_path)
+        FIX: Gère les dict OHLC et les floats simples
         """
         base, quote = self.parse_symbol(symbol)
         
@@ -75,27 +67,34 @@ class CurrencyConverter:
         if quote == self.account_currency:
             return pnl_amount, 1.0, f"{quote}→{self.account_currency} (direct)"
         
+        # ========== FIX: Extraction du prix close ==========
+        def get_price(sym: str) -> Optional[float]:
+            """Helper pour extraire le prix close d'un dict ou float"""
+            price_data = current_prices.get(sym)
+            if price_data is None:
+                return None
+            if isinstance(price_data, dict):
+                return price_data.get('close')
+            return price_data
+        # ==================================================
+        
         # Cas 2: Symbole contient EUR en devise de base (EURGBP, EURUSD)
         if base == self.account_currency:
-            # EURGBP: PnL en GBP, taux EUR/GBP disponible
-            # Conversion: 1 GBP = (1 / EUR/GBP) EUR
-            eur_quote_rate = current_prices.get(symbol)
+            eur_quote_rate = get_price(symbol)
             if eur_quote_rate:
                 conversion_rate = 1 / eur_quote_rate
                 pnl_eur = pnl_amount * conversion_rate
                 return pnl_eur, conversion_rate, f"{quote}→{self.account_currency} (via {symbol})"
         
         # Cas 3: Aucun EUR dans le symbole (GBPNZD, GBPUSD, etc.)
-        # → Conversion en 2 étapes
-        symbol_rate = current_prices.get(symbol)
+        symbol_rate = get_price(symbol)
         if symbol_rate:
-            pnl_in_base = pnl_amount / symbol_rate  # Quote → Base
+            pnl_in_base = pnl_amount / symbol_rate
             
-            # Chercher un taux EUR/BASE
-            eur_base_symbol = f"{self.account_currency}{base}"  # EURGBP
+            eur_base_symbol = f"{self.account_currency}{base}"
+            eur_base_rate = get_price(eur_base_symbol)
             
-            if eur_base_symbol in current_prices:
-                eur_base_rate = current_prices[eur_base_symbol]
+            if eur_base_rate:
                 conversion_rate = 1 / eur_base_rate
                 pnl_eur = pnl_in_base * conversion_rate
                 return pnl_eur, conversion_rate, f"{quote}→{base}→{self.account_currency} (via {symbol} + {eur_base_symbol})"
@@ -117,7 +116,6 @@ class CurrencyConverter:
             logging.warning(f"[CONVERTER] Utilisation taux fixe pour {quote}→EUR: {rate:.5f}")
             return pnl_eur, rate, f"{quote}→{self.account_currency} (FALLBACK FIXE)"
         
-        # Cas 5: Impossible de convertir
         logging.error(f"[CONVERTER] Impossible de convertir {quote}→{self.account_currency} pour {symbol}")
         return pnl_amount, 1.0, f"{quote}→{self.account_currency} (ERREUR - PAS DE CONVERSION)"
 
@@ -296,7 +294,13 @@ class Broker:
         equity_value = self.balance
         
         for pos in self.positions:
-            current_price = current_prices.get(pos.symbol, pos.entry_price)
+            # ========== FIX: Gérer dict ou float ==========
+            price_data = current_prices.get(pos.symbol, pos.entry_price)
+            if isinstance(price_data, dict):
+                current_price = price_data.get('close', pos.entry_price)
+            else:
+                current_price = price_data
+            # ==============================================
             
             # PnL flottant en devise de cotation
             spread_pips = self.spread_config.get(pos.symbol, 1.0)
@@ -329,7 +333,14 @@ class Broker:
         
         margin = 0.0
         for pos in self.positions:
-            price = current_prices.get(pos.symbol, pos.entry_price)
+            # ========== FIX: Gérer dict ou float ==========
+            price_data = current_prices.get(pos.symbol, pos.entry_price)
+            if isinstance(price_data, dict):
+                price = price_data.get('close', pos.entry_price)
+            else:
+                price = price_data
+            # ==============================================
+            
             notional = price * 100000 * pos.lots  # contract_size = 100,000
             margin += notional / self.leverage
         
