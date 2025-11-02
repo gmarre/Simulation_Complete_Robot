@@ -12,6 +12,8 @@ from typing import List, Dict, Optional
 from robots.CandleSuite_Paul import CandleSuitePaul
 from robots.DailyTimeWindowRobot import DailyTimeWindowRobot
 
+logging.disable(logging.CRITICAL)
+
 # ========== CONFIGURATION ==========
 TIMEFRAME_MAP = {
     'm1': '1min', 'm5': '5min', 'm15': '15min', 'm30': '30min',
@@ -144,6 +146,26 @@ def create_robots(args) -> List:
             'id': 'CS1_m30', 'tf': 'm30', 'suite': 8, 'xtrem': 200, 
             'atr': 200, 'tp': 2.5, 'lot': 0.1, 'dist': 3, 'factor': 2, 
             'inversion': False
+        },
+        {
+            'id': 'CS1_m15', 'tf': 'm15', 'suite': 6, 'xtrem': 100, 
+            'atr': 200, 'tp': 3, 'lot': 0.1, 'dist': 3, 'factor': 2, 
+            'inversion': False
+        },
+        {
+            'id': 'CS1_H1', 'tf': 'h1', 'suite': 3, 'xtrem': 200, 
+            'atr': 200, 'tp': 1.5, 'lot': 0.1, 'dist': 5, 'factor': 2.5, 
+            'inversion': False
+        },
+        {
+            'id': 'CS1_m30', 'tf': 'm30', 'suite': 4, 'xtrem': 150, 
+            'atr': 200, 'tp': 2.5, 'lot': 0.1, 'dist': 3, 'factor': 2.5, 
+            'inversion': False
+        },
+        {
+            'id': 'CS1_m15', 'tf': 'm15', 'suite': 6, 'xtrem': 200, 
+            'atr': 200, 'tp': 1.5, 'lot': 0.1, 'dist': 5, 'factor': 1.5, 
+            'inversion': True
         },
         # Ajoutez ici les 50 autres robots...
         # {
